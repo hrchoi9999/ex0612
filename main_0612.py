@@ -1,6 +1,5 @@
 import io
 import os
-import tempfile
 
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
@@ -9,25 +8,24 @@ import streamlit as st
 from langchain_chroma import Chroma
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4.1-mini"
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "cp949", "euc-kr")
+KEYWORD_COLUMNS = ("시군구", "읍면동", "단지명", "도로명", "건축년도", "번지")
 
 
-st.set_page_config(page_title="PDF/CSV 분석 AI", page_icon="📄", layout="wide")
-st.title("📄 PDF/CSV File Reader")
+st.set_page_config(page_title="CSV 파일 분석", page_icon="📊", layout="wide")
+st.title("CSV 파일 분석")
 st.write("----------------")
 
 
-with st.expander("🔑 OpenAI API Key 발급 안내", expanded=True):
+with st.expander("OpenAI API Key 발급 안내", expanded=True):
     st.markdown(
         """
         1. OpenAI Platform에 로그인합니다.
@@ -46,26 +44,22 @@ with st.expander("🔑 OpenAI API Key 발급 안내", expanded=True):
 
 
 openai_key = st.text_input("OPENAI_API_KEY", type="password")
-uploaded_file = st.file_uploader("PDF 또는 CSV 파일을 올려주세요.", type=["pdf", "csv"])
+uploaded_file = st.file_uploader("분석할 CSV 파일을 올려주세요.", type=["csv"])
 st.write("----------------")
 
 
-def pdf_to_documents(uploaded_file):
-    """Streamlit에 업로드된 PDF를 LangChain Document 목록으로 변환합니다."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_filepath = os.path.join(temp_dir, uploaded_file.name)
-        with open(temp_filepath, "wb") as f:
-            f.write(uploaded_file.getvalue())
-
-        loader = PyPDFLoader(temp_filepath)
-        return loader.load()
+def clean_value(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
 
 
 def find_csv_header_line(file_bytes, encoding):
     """안내문이 포함된 CSV에서 실제 컬럼 헤더가 시작되는 줄을 찾습니다."""
     decoded = file_bytes.decode(encoding)
+    header_keywords = ("NO", "시군구", "단지명", "도로명")
     for index, line in enumerate(decoded.splitlines()):
-        if "," in line and any(keyword in line for keyword in ("NO", "시군구", "단지명", "도로명")):
+        if "," in line and any(keyword in line for keyword in header_keywords):
             return index
     return 0
 
@@ -85,19 +79,13 @@ def read_csv_uploaded_file(uploaded_file):
                 dtype=str,
                 keep_default_na=False,
             )
-            df = df.loc[df.apply(lambda row: any(clean_value(value) for value in row), axis=1)]
             df.columns = [str(column).strip() for column in df.columns]
+            df = df.loc[df.apply(lambda row: any(clean_value(value) for value in row), axis=1)]
             return df, encoding, header_line
         except Exception as error:
             last_error = error
 
     raise ValueError(f"CSV 파일을 읽을 수 없습니다. 마지막 오류: {last_error}")
-
-
-def clean_value(value):
-    if pd.isna(value):
-        return ""
-    return str(value).strip()
 
 
 def format_csv_value(column, value):
@@ -111,18 +99,19 @@ def format_csv_value(column, value):
 
 
 def csv_row_to_document(row, row_index, source_name):
-    """CSV 한 행을 검색 친화적인 텍스트 청크로 변환합니다."""
+    """CSV 한 행을 ChromaDB 검색에 유리한 텍스트 청크로 변환합니다."""
     fields = []
     keywords = []
 
     for column, value in row.items():
-        formatted_value = format_csv_value(str(column), value)
+        column_name = str(column)
+        formatted_value = format_csv_value(column_name, value)
         if not formatted_value:
             continue
 
-        fields.append(f"{column}: {formatted_value}")
+        fields.append(f"{column_name}: {formatted_value}")
 
-        if column in ("시군구", "읍면동", "단지명", "도로명", "건축년도", "번지"):
+        if column_name in KEYWORD_COLUMNS:
             keywords.append(formatted_value)
 
     page_content = "\n".join(
@@ -152,28 +141,6 @@ def csv_to_documents(uploaded_file):
     return documents, df, encoding, skipped_rows
 
 
-def build_documents(uploaded_file):
-    extension = uploaded_file.name.lower().rsplit(".", 1)[-1]
-
-    if extension == "pdf":
-        pages = pdf_to_documents(uploaded_file)
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=100,
-        )
-        return text_splitter.split_documents(pages), "pdf", None
-
-    if extension == "csv":
-        documents, df, encoding, skipped_rows = csv_to_documents(uploaded_file)
-        return documents, "csv", {
-            "dataframe": df,
-            "encoding": encoding,
-            "skipped_rows": skipped_rows,
-        }
-
-    raise ValueError("지원하지 않는 파일 형식입니다.")
-
-
 class StreamHandler(BaseCallbackHandler):
     """LLM이 생성하는 토큰을 Streamlit 화면에 실시간 출력합니다."""
 
@@ -196,7 +163,7 @@ def show_csv_preview(csv_info):
 
 
 def show_retrieval_debug(db):
-    with st.expander("🔎 CSV 검색 품질 확인", expanded=True):
+    with st.expander("CSV 검색 품질 확인", expanded=True):
         st.caption(
             "ChromaDB 유사도 검색이 자연어 질문에서 관련 행 청크를 찾는지 확인합니다."
         )
@@ -214,33 +181,35 @@ def show_retrieval_debug(db):
                     term in document.page_content
                     for term in ("아남1", "명륜2가", "건축년도: 1995년", "도로명: 창경궁로 265")
                 )
+                status = "포함" if contains_required_terms else "확인 필요"
                 st.markdown(
                     f"**{rank}. row {document.metadata.get('row_index', '-')} "
-                    f"| distance {score:.4f} "
-                    f"| 핵심 청크 포함: {'✅' if contains_required_terms else '⚠️'}**"
+                    f"| distance {score:.4f} | 핵심 청크: {status}**"
                 )
                 st.code(document.page_content, language="text")
 
 
 if uploaded_file is not None:
     if not openai_key:
-        st.warning("파일 분석을 시작하려면 OpenAI API Key를 입력해 주세요.")
+        st.warning("CSV 분석을 시작하려면 OpenAI API Key를 입력해 주세요.")
         st.stop()
 
-    with st.spinner("문서를 읽고 벡터 DB를 생성하는 중입니다...", show_time=True):
-        texts, file_type, csv_info = build_documents(uploaded_file)
+    with st.spinner("CSV를 읽고 벡터 DB를 생성하는 중입니다...", show_time=True):
+        documents, df, encoding, skipped_rows = csv_to_documents(uploaded_file)
         embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=openai_key)
-        db = Chroma.from_documents(documents=texts, embedding=embeddings)
+        db = Chroma.from_documents(documents=documents, embedding=embeddings)
 
-    if file_type == "csv":
-        show_csv_preview(csv_info)
-        show_retrieval_debug(db)
-    else:
-        st.success(f"PDF 로드 완료: 검색 청크 {len(texts):,}개")
+    csv_info = {
+        "dataframe": df,
+        "encoding": encoding,
+        "skipped_rows": skipped_rows,
+    }
+    show_csv_preview(csv_info)
+    show_retrieval_debug(db)
 
     retriever = db.as_retriever(search_kwargs={"k": 5})
 
-    st.header("파일 내용에 대해 질문하세요")
+    st.header("CSV 내용에 대해 질문하세요")
     question = st.text_input(
         "질문 입력",
         placeholder="예: 명륜2가 아남1의 건축년도와 도로명은?",
@@ -264,9 +233,9 @@ if uploaded_file is not None:
 
                 prompt = ChatPromptTemplate.from_template(
                     """
-                    당신은 PDF와 CSV 데이터를 분석하는 AI입니다.
+                    당신은 CSV 데이터를 분석하는 AI입니다.
                     아래 Context에 있는 내용만 근거로 답변하세요.
-                    CSV 데이터라면 관련 행의 컬럼명과 값을 함께 설명하세요.
+                    관련 행의 컬럼명과 값을 함께 설명하세요.
                     정확한 근거가 Context에 없으면 모른다고 답하세요.
 
                     Context:
