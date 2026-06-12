@@ -275,6 +275,65 @@ def merge_documents(primary_documents, secondary_documents):
     return merged
 
 
+def find_column(columns, candidates):
+    normalized_columns = {normalize_for_match(column): column for column in columns}
+    for candidate in candidates:
+        normalized_candidate = normalize_for_match(candidate)
+        if normalized_candidate in normalized_columns:
+            return normalized_columns[normalized_candidate]
+    return None
+
+
+def to_number(value):
+    text = clean_value(value).replace(",", "")
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    return float(match.group())
+
+
+def is_floor_range_question(question):
+    compact_question = normalize_for_match(question)
+    return "층" in compact_question and (
+        ("최저" in compact_question and "최고" in compact_question)
+        or ("가장낮" in compact_question and "가장높" in compact_question)
+        or ("최소" in compact_question and "최대" in compact_question)
+    )
+
+
+def build_floor_range_answer(question, combined_preview, matching_rows):
+    if not is_floor_range_question(question):
+        return "", pd.DataFrame()
+
+    base_rows = matching_rows if not matching_rows.empty else combined_preview
+    floor_column = find_column(base_rows.columns, ("층", "해당층", "거래층"))
+    if floor_column is None:
+        return "CSV에서 층 정보를 나타내는 컬럼을 찾지 못했습니다.", pd.DataFrame()
+
+    result_rows = base_rows.copy()
+    result_rows["_층숫자"] = result_rows[floor_column].apply(to_number)
+    result_rows = result_rows.dropna(subset=["_층숫자"])
+
+    if result_rows.empty:
+        return "층 컬럼은 찾았지만 숫자로 계산할 수 있는 층 값이 없습니다.", pd.DataFrame()
+
+    min_floor = int(result_rows["_층숫자"].min())
+    max_floor = int(result_rows["_층숫자"].max())
+    min_rows = result_rows[result_rows["_층숫자"] == min_floor]
+    max_rows = result_rows[result_rows["_층숫자"] == max_floor]
+    evidence_rows = pd.concat([min_rows, max_rows]).drop_duplicates()
+
+    answer = (
+        f"원본 CSV의 `{floor_column}` 컬럼을 기준으로 계산하면 "
+        f"최저층은 **{min_floor}층**, 최고층은 **{max_floor}층**입니다.\n\n"
+        f"- 계산 대상 행 수: {len(result_rows):,}건\n"
+        f"- 최저층 해당 행: {len(min_rows):,}건\n"
+        f"- 최고층 해당 행: {len(max_rows):,}건"
+    )
+
+    return answer, evidence_rows.drop(columns=["_층숫자"], errors="ignore")
+
+
 class StreamHandler(BaseCallbackHandler):
     """LLM이 생성하는 토큰을 Streamlit 화면에 실시간 출력합니다."""
 
@@ -387,6 +446,22 @@ if uploaded_files:
                         f"원본 CSV 매칭 행: {len(matching_rows):,}건"
                     )
                     st.dataframe(matching_rows, use_container_width=True, hide_index=True)
+
+                floor_answer, floor_evidence_rows = build_floor_range_answer(
+                    question,
+                    combined_preview,
+                    matching_rows,
+                )
+                if floor_answer:
+                    st.markdown(floor_answer)
+                    if not floor_evidence_rows.empty:
+                        with st.expander("최저층/최고층 계산 근거 행", expanded=True):
+                            st.dataframe(
+                                floor_evidence_rows,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                    st.stop()
 
                 llm = ChatOpenAI(
                     model=CHAT_MODEL,
