@@ -1,13 +1,13 @@
 import io
 import hashlib
 import os
+import re
 
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 import pandas as pd
 import streamlit as st
 from langchain_chroma import Chroma
-from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
@@ -157,6 +157,7 @@ def build_multi_csv_documents(uploaded_files):
         all_documents.extend(documents)
 
         preview_df = df.copy()
+        preview_df.insert(0, "CSV 행 번호", range(1, len(preview_df) + 1))
         preview_df.insert(0, "파일명", uploaded_file.name)
         preview_frames.append(preview_df)
 
@@ -185,6 +186,93 @@ def get_upload_signature(uploaded_files):
         digest = hashlib.sha256(file_bytes).hexdigest()
         signature.append((uploaded_file.name, len(file_bytes), digest))
     return tuple(signature)
+
+
+def normalize_for_match(value):
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", clean_value(value)).lower()
+
+
+def extract_match_terms(question, combined_preview):
+    compact_question = normalize_for_match(question)
+    terms = []
+
+    year_month_match = re.search(r"(20\d{2})\s*년\s*0?(\d{1,2})\s*월", question)
+    if year_month_match:
+        year, month = year_month_match.groups()
+        terms.append(f"{year}{int(month):02d}")
+
+    stopwords = {
+        "거래정보",
+        "조회",
+        "정보",
+        "알려주세요",
+        "있는",
+        "아파트",
+        "아파트의",
+        "주소",
+    }
+    row_texts = combined_preview.apply(
+        lambda row: normalize_for_match(" ".join(clean_value(value) for value in row)),
+        axis=1,
+    )
+
+    for token in re.findall(r"[0-9A-Za-z가-힣]+", question):
+        token = token.strip()
+        compact_token = normalize_for_match(token)
+        if len(compact_token) < 2 or compact_token in stopwords:
+            continue
+        if compact_token in compact_question and row_texts.str.contains(compact_token, regex=False).any():
+            terms.append(compact_token)
+
+    return list(dict.fromkeys(terms))
+
+
+def find_matching_rows(question, combined_preview):
+    if combined_preview.empty:
+        return pd.DataFrame(), []
+
+    terms = extract_match_terms(question, combined_preview)
+    if not terms:
+        return pd.DataFrame(), []
+
+    row_texts = combined_preview.apply(
+        lambda row: normalize_for_match(" ".join(clean_value(value) for value in row)),
+        axis=1,
+    )
+    mask = pd.Series(True, index=combined_preview.index)
+    for term in terms:
+        mask &= row_texts.str.contains(term, regex=False)
+
+    return combined_preview.loc[mask].copy(), terms
+
+
+def matching_rows_to_documents(matching_rows):
+    documents = []
+    for _, row in matching_rows.iterrows():
+        source_name = clean_value(row.get("파일명", "CSV"))
+        row_index_text = clean_value(row.get("CSV 행 번호", ""))
+        row_index = int(row_index_text) if row_index_text.isdigit() else 0
+        row_data = row.drop(labels=["파일명", "CSV 행 번호"], errors="ignore")
+        documents.append(csv_row_to_document(row_data, row_index - 1, source_name))
+    return documents
+
+
+def merge_documents(primary_documents, secondary_documents):
+    merged = []
+    seen = set()
+
+    for document in [*primary_documents, *secondary_documents]:
+        key = (
+            document.metadata.get("source"),
+            document.metadata.get("row_index"),
+            document.page_content,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(document)
+
+    return merged
 
 
 class StreamHandler(BaseCallbackHandler):
@@ -291,6 +379,15 @@ if uploaded_files:
             st.warning("질문을 입력해 주세요.")
         else:
             with st.spinner("답변 생성 중입니다...", show_time=True):
+                matching_rows, match_terms = find_matching_rows(question, combined_preview)
+                if not matching_rows.empty:
+                    st.subheader("조건에 맞는 CSV 원본 행")
+                    st.caption(
+                        f"질문에서 찾은 조건: {', '.join(match_terms)} | "
+                        f"원본 CSV 매칭 행: {len(matching_rows):,}건"
+                    )
+                    st.dataframe(matching_rows, use_container_width=True, hide_index=True)
+
                 llm = ChatOpenAI(
                     model=CHAT_MODEL,
                     temperature=0,
@@ -315,9 +412,15 @@ if uploaded_files:
                 )
 
                 document_chain = create_stuff_documents_chain(llm, prompt)
-                qa_chain = create_retrieval_chain(retriever, document_chain)
-                response = qa_chain.invoke({"input": question})
-                answer = response.get("answer", "")
+                retrieved_documents = retriever.invoke(question)
+                exact_documents = matching_rows_to_documents(matching_rows)
+                context_documents = merge_documents(exact_documents, retrieved_documents)
+                answer = document_chain.invoke(
+                    {
+                        "input": question,
+                        "context": context_documents,
+                    }
+                )
 
                 if answer:
                     st.markdown(answer)
@@ -325,7 +428,7 @@ if uploaded_files:
                     st.warning("답변이 비어 있습니다. 질문을 조금 더 구체적으로 입력해 주세요.")
 
                 with st.expander("답변에 사용된 검색 근거", expanded=False):
-                    for index, document in enumerate(response.get("context", []), start=1):
+                    for index, document in enumerate(context_documents, start=1):
                         st.markdown(
                             f"**{index}. {document.metadata.get('source', '-')} "
                             f"| row {document.metadata.get('row_index', '-')}**"
