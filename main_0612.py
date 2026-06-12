@@ -2,6 +2,8 @@ import io
 import os
 import tempfile
 
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 import pandas as pd
 import streamlit as st
 from langchain_chroma import Chroma
