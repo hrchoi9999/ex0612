@@ -44,7 +44,11 @@ with st.expander("OpenAI API Key 발급 안내", expanded=True):
 
 
 openai_key = st.text_input("OPENAI_API_KEY", type="password")
-uploaded_file = st.file_uploader("분석할 CSV 파일을 올려주세요.", type=["csv"])
+uploaded_files = st.file_uploader(
+    "분석할 CSV 파일을 하나 이상 올려주세요.",
+    type=["csv"],
+    accept_multiple_files=True,
+)
 st.write("----------------")
 
 
@@ -116,6 +120,7 @@ def csv_row_to_document(row, row_index, source_name):
 
     page_content = "\n".join(
         [
+            f"파일명: {source_name}",
             f"CSV 행 번호: {row_index + 1}",
             "검색 키워드: " + " ".join(dict.fromkeys(keywords)),
             *fields,
@@ -141,6 +146,37 @@ def csv_to_documents(uploaded_file):
     return documents, df, encoding, skipped_rows
 
 
+def build_multi_csv_documents(uploaded_files):
+    all_documents = []
+    csv_infos = []
+    preview_frames = []
+
+    for uploaded_file in uploaded_files:
+        documents, df, encoding, skipped_rows = csv_to_documents(uploaded_file)
+        all_documents.extend(documents)
+
+        preview_df = df.copy()
+        preview_df.insert(0, "파일명", uploaded_file.name)
+        preview_frames.append(preview_df)
+
+        csv_infos.append(
+            {
+                "filename": uploaded_file.name,
+                "rows": len(df),
+                "columns": len(df.columns),
+                "encoding": encoding,
+                "skipped_rows": skipped_rows,
+            }
+        )
+
+    combined_preview = (
+        pd.concat(preview_frames, ignore_index=True, sort=False)
+        if preview_frames
+        else pd.DataFrame()
+    )
+    return all_documents, csv_infos, combined_preview
+
+
 class StreamHandler(BaseCallbackHandler):
     """LLM이 생성하는 토큰을 Streamlit 화면에 실시간 출력합니다."""
 
@@ -153,19 +189,30 @@ class StreamHandler(BaseCallbackHandler):
         self.container.markdown(self.text)
 
 
-def show_csv_preview(csv_info):
-    df = csv_info["dataframe"]
-    st.success(
-        f"CSV 로드 완료: {len(df):,}행, {len(df.columns):,}열 "
-        f"(인코딩: {csv_info['encoding']}, 건너뛴 안내 행: {csv_info['skipped_rows']})"
-    )
-    st.dataframe(df.head(20), use_container_width=True)
+def show_csv_preview(csv_infos, combined_preview):
+    total_rows = sum(info["rows"] for info in csv_infos)
+    st.success(f"CSV 로드 완료: {len(csv_infos):,}개 파일, 총 {total_rows:,}행")
+
+    summary_rows = [
+        {
+            "파일명": info["filename"],
+            "행 수": info["rows"],
+            "열 수": info["columns"],
+            "인코딩": info["encoding"],
+            "건너뛴 안내 행": info["skipped_rows"],
+        }
+        for info in csv_infos
+    ]
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    with st.expander("통합 미리보기", expanded=True):
+        st.dataframe(combined_preview.head(50), use_container_width=True)
 
 
 def show_retrieval_debug(db):
     with st.expander("CSV 검색 품질 확인", expanded=True):
         st.caption(
-            "ChromaDB 유사도 검색이 자연어 질문에서 관련 행 청크를 찾는지 확인합니다."
+            "업로드한 모든 CSV 파일의 행 청크를 하나의 ChromaDB에 넣고 유사도 검색합니다."
         )
         default_query = "명륜2가 아남1 아파트의 건축년도와 도로명을 알려줘"
         debug_query = st.text_input("검색 테스트 문장", value=default_query)
@@ -183,33 +230,29 @@ def show_retrieval_debug(db):
                 )
                 status = "포함" if contains_required_terms else "확인 필요"
                 st.markdown(
-                    f"**{rank}. row {document.metadata.get('row_index', '-')} "
+                    f"**{rank}. {document.metadata.get('source', '-')} "
+                    f"| row {document.metadata.get('row_index', '-')} "
                     f"| distance {score:.4f} | 핵심 청크: {status}**"
                 )
                 st.code(document.page_content, language="text")
 
 
-if uploaded_file is not None:
+if uploaded_files:
     if not openai_key:
         st.warning("CSV 분석을 시작하려면 OpenAI API Key를 입력해 주세요.")
         st.stop()
 
-    with st.spinner("CSV를 읽고 벡터 DB를 생성하는 중입니다...", show_time=True):
-        documents, df, encoding, skipped_rows = csv_to_documents(uploaded_file)
+    with st.spinner("CSV 파일들을 읽고 통합 벡터 DB를 생성하는 중입니다...", show_time=True):
+        documents, csv_infos, combined_preview = build_multi_csv_documents(uploaded_files)
         embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=openai_key)
         db = Chroma.from_documents(documents=documents, embedding=embeddings)
 
-    csv_info = {
-        "dataframe": df,
-        "encoding": encoding,
-        "skipped_rows": skipped_rows,
-    }
-    show_csv_preview(csv_info)
+    show_csv_preview(csv_infos, combined_preview)
     show_retrieval_debug(db)
 
-    retriever = db.as_retriever(search_kwargs={"k": 5})
+    retriever = db.as_retriever(search_kwargs={"k": 7})
 
-    st.header("CSV 내용에 대해 질문하세요")
+    st.header("업로드한 CSV 전체 내용에 대해 질문하세요")
     question = st.text_input(
         "질문 입력",
         placeholder="예: 명륜2가 아남1의 건축년도와 도로명은?",
@@ -233,9 +276,9 @@ if uploaded_file is not None:
 
                 prompt = ChatPromptTemplate.from_template(
                     """
-                    당신은 CSV 데이터를 분석하는 AI입니다.
+                    당신은 여러 CSV 데이터를 함께 분석하는 AI입니다.
                     아래 Context에 있는 내용만 근거로 답변하세요.
-                    관련 행의 컬럼명과 값을 함께 설명하세요.
+                    답변에는 근거가 된 파일명, 행 번호, 컬럼명과 값을 함께 설명하세요.
                     정확한 근거가 Context에 없으면 모른다고 답하세요.
 
                     Context:

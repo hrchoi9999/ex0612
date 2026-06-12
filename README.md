@@ -1,6 +1,6 @@
 # ex0612
 
-Streamlit app for CSV question answering with OpenAI embeddings and ChromaDB.
+Streamlit app for multi-file CSV question answering with OpenAI embeddings and ChromaDB.
 
 ## Run locally
 
