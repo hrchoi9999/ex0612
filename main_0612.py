@@ -1,4 +1,5 @@
 import io
+import hashlib
 import os
 
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
@@ -177,6 +178,15 @@ def build_multi_csv_documents(uploaded_files):
     return all_documents, csv_infos, combined_preview
 
 
+def get_upload_signature(uploaded_files):
+    signature = []
+    for uploaded_file in uploaded_files:
+        file_bytes = uploaded_file.getvalue()
+        digest = hashlib.sha256(file_bytes).hexdigest()
+        signature.append((uploaded_file.name, len(file_bytes), digest))
+    return tuple(signature)
+
+
 class StreamHandler(BaseCallbackHandler):
     """LLM이 생성하는 토큰을 Streamlit 화면에 실시간 출력합니다."""
 
@@ -242,10 +252,28 @@ if uploaded_files:
         st.warning("CSV 분석을 시작하려면 OpenAI API Key를 입력해 주세요.")
         st.stop()
 
-    with st.spinner("CSV 파일들을 읽고 통합 벡터 DB를 생성하는 중입니다...", show_time=True):
-        documents, csv_infos, combined_preview = build_multi_csv_documents(uploaded_files)
-        embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=openai_key)
-        db = Chroma.from_documents(documents=documents, embedding=embeddings)
+    upload_signature = get_upload_signature(uploaded_files)
+    cached_store = st.session_state.get("csv_vector_store")
+
+    if cached_store and cached_store["signature"] == upload_signature:
+        documents = cached_store["documents"]
+        csv_infos = cached_store["csv_infos"]
+        combined_preview = cached_store["combined_preview"]
+        db = cached_store["db"]
+        st.info("업로드한 CSV 파일이 변경되지 않아 기존 벡터 DB를 재사용합니다.")
+    else:
+        with st.spinner("CSV 파일들을 읽고 통합 벡터 DB를 생성하는 중입니다...", show_time=True):
+            documents, csv_infos, combined_preview = build_multi_csv_documents(uploaded_files)
+            embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=openai_key)
+            db = Chroma.from_documents(documents=documents, embedding=embeddings)
+
+        st.session_state["csv_vector_store"] = {
+            "signature": upload_signature,
+            "documents": documents,
+            "csv_infos": csv_infos,
+            "combined_preview": combined_preview,
+            "db": db,
+        }
 
     show_csv_preview(csv_infos, combined_preview)
     show_retrieval_debug(db)
@@ -263,15 +291,10 @@ if uploaded_files:
             st.warning("질문을 입력해 주세요.")
         else:
             with st.spinner("답변 생성 중입니다...", show_time=True):
-                chat_box = st.empty()
-                handler = StreamHandler(chat_box)
-
                 llm = ChatOpenAI(
                     model=CHAT_MODEL,
                     temperature=0,
                     api_key=openai_key,
-                    streaming=True,
-                    callbacks=[handler],
                 )
 
                 prompt = ChatPromptTemplate.from_template(
@@ -293,4 +316,18 @@ if uploaded_files:
 
                 document_chain = create_stuff_documents_chain(llm, prompt)
                 qa_chain = create_retrieval_chain(retriever, document_chain)
-                qa_chain.invoke({"input": question})
+                response = qa_chain.invoke({"input": question})
+                answer = response.get("answer", "")
+
+                if answer:
+                    st.markdown(answer)
+                else:
+                    st.warning("답변이 비어 있습니다. 질문을 조금 더 구체적으로 입력해 주세요.")
+
+                with st.expander("답변에 사용된 검색 근거", expanded=False):
+                    for index, document in enumerate(response.get("context", []), start=1):
+                        st.markdown(
+                            f"**{index}. {document.metadata.get('source', '-')} "
+                            f"| row {document.metadata.get('row_index', '-')}**"
+                        )
+                        st.code(document.page_content, language="text")
