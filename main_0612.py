@@ -19,6 +19,8 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4.1-mini"
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "cp949", "euc-kr")
 KEYWORD_COLUMNS = ("시군구", "읍면동", "단지명", "도로명", "건축년도", "번지")
+FILE_NAME_COLUMN = "파일명"
+ROW_NUMBER_COLUMN = "CSV 행 번호"
 
 
 st.set_page_config(page_title="CSV 파일 분석", page_icon="📊", layout="wide")
@@ -157,8 +159,8 @@ def build_multi_csv_documents(uploaded_files):
         all_documents.extend(documents)
 
         preview_df = df.copy()
-        preview_df.insert(0, "CSV 행 번호", range(1, len(preview_df) + 1))
-        preview_df.insert(0, "파일명", uploaded_file.name)
+        preview_df.insert(0, ROW_NUMBER_COLUMN, range(1, len(preview_df) + 1))
+        preview_df.insert(0, FILE_NAME_COLUMN, uploaded_file.name)
         preview_frames.append(preview_df)
 
         csv_infos.append(
@@ -249,12 +251,37 @@ def find_matching_rows(question, combined_preview):
 def matching_rows_to_documents(matching_rows):
     documents = []
     for _, row in matching_rows.iterrows():
-        source_name = clean_value(row.get("파일명", "CSV"))
-        row_index_text = clean_value(row.get("CSV 행 번호", ""))
+        source_name = clean_value(row.get(FILE_NAME_COLUMN, "CSV"))
+        row_index_text = clean_value(row.get(ROW_NUMBER_COLUMN, ""))
         row_index = int(row_index_text) if row_index_text.isdigit() else 0
-        row_data = row.drop(labels=["파일명", "CSV 행 번호"], errors="ignore")
+        row_data = row.drop(labels=[FILE_NAME_COLUMN, ROW_NUMBER_COLUMN], errors="ignore")
         documents.append(csv_row_to_document(row_data, row_index - 1, source_name))
     return documents
+
+
+def is_blank_series(series):
+    return series.apply(clean_value).eq("").all()
+
+
+def prepare_display_rows(rows):
+    if rows.empty:
+        return rows
+
+    display_rows = rows.copy()
+    keep_columns = []
+    preferred_columns = [FILE_NAME_COLUMN, ROW_NUMBER_COLUMN]
+
+    for column in display_rows.columns:
+        if column in preferred_columns or not is_blank_series(display_rows[column]):
+            keep_columns.append(column)
+
+    ordered_columns = [
+        column for column in preferred_columns if column in keep_columns
+    ] + [
+        column for column in keep_columns if column not in preferred_columns
+    ]
+
+    return display_rows[ordered_columns].fillna("")
 
 
 def merge_documents(primary_documents, secondary_documents):
@@ -445,7 +472,11 @@ if uploaded_files:
                         f"질문에서 찾은 조건: {', '.join(match_terms)} | "
                         f"원본 CSV 매칭 행: {len(matching_rows):,}건"
                     )
-                    st.dataframe(matching_rows, use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        prepare_display_rows(matching_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
                 floor_answer, floor_evidence_rows = build_floor_range_answer(
                     question,
@@ -457,7 +488,7 @@ if uploaded_files:
                     if not floor_evidence_rows.empty:
                         with st.expander("최저층/최고층 계산 근거 행", expanded=True):
                             st.dataframe(
-                                floor_evidence_rows,
+                                prepare_display_rows(floor_evidence_rows),
                                 use_container_width=True,
                                 hide_index=True,
                             )
