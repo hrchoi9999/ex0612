@@ -89,7 +89,6 @@ def read_scores() -> list[dict]:
         avg = round(total / 3, 1)
         result.append(
             {
-                "번호": row["id"],
                 "이름": row["name"],
                 "국어": row["kor"],
                 "영어": row["eng"],
@@ -99,7 +98,30 @@ def read_scores() -> list[dict]:
                 "학점": get_grade(avg),
             }
         )
-    return result
+
+    result.sort(key=lambda row: (-row["총점"], row["이름"]))
+    previous_total = None
+    current_rank = 0
+    for index, row in enumerate(result, start=1):
+        if row["총점"] != previous_total:
+            current_rank = index
+            previous_total = row["총점"]
+        row["석차"] = current_rank
+
+    result.sort(key=lambda row: (row["석차"], row["이름"]))
+    return [
+        {
+            "석차": row["석차"],
+            "이름": row["이름"],
+            "국어": row["국어"],
+            "영어": row["영어"],
+            "컴퓨터": row["컴퓨터"],
+            "총점": row["총점"],
+            "평균": row["평균"],
+            "학점": row["학점"],
+        }
+        for row in result
+    ]
 
 
 def add_random_student() -> None:
@@ -118,69 +140,12 @@ def add_random_student() -> None:
         conn.commit()
 
 
-def render_report_card(row: dict) -> None:
-    st.markdown(
-        f"""
-        <div class="report-card">
-            <div class="report-title">********* {row['이름']}님의 성적표 *********</div>
-            <div class="score-grid">
-                <span>이름</span><strong>{row['이름']}</strong>
-                <span>국어</span><strong>{row['국어']} 점</strong>
-                <span>영어</span><strong>{row['영어']} 점</strong>
-                <span>컴퓨터</span><strong>{row['컴퓨터']} 점</strong>
-            </div>
-            <div class="summary">
-                <span>총점 <b>{row['총점']} 점</b></span>
-                <span>평균 <b>{row['평균']} 점</b></span>
-                <span>학점 <b>{row['학점']} 학점</b></span>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
 def main() -> None:
     st.set_page_config(page_title="성적표 조회", page_icon="📘", layout="wide")
     st.markdown(
         """
         <style>
         .main .block-container { max-width: 1120px; padding-top: 2rem; }
-        .report-card {
-            border: 1px solid #d8dee9;
-            border-radius: 8px;
-            background: #ffffff;
-            padding: 28px 32px;
-            box-shadow: 0 8px 24px rgba(31, 41, 55, 0.08);
-            margin: 18px 0 28px;
-        }
-        .report-title {
-            text-align: center;
-            font-size: 26px;
-            font-weight: 800;
-            color: #172033;
-            margin-bottom: 26px;
-        }
-        .score-grid {
-            display: grid;
-            grid-template-columns: 120px 1fr;
-            gap: 12px 18px;
-            max-width: 420px;
-            margin: 0 auto 24px;
-            font-size: 22px;
-        }
-        .score-grid span { color: #5a677d; }
-        .score-grid strong { color: #172033; }
-        .summary {
-            display: flex;
-            justify-content: center;
-            gap: 34px;
-            flex-wrap: wrap;
-            border-top: 1px solid #e5e7eb;
-            padding-top: 20px;
-            font-size: 22px;
-        }
-        .summary b { color: #0f766e; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -196,12 +161,8 @@ def main() -> None:
     col2.metric("전체 평균", f"{round(sum(r['평균'] for r in scores) / len(scores), 1)}점")
     col3.metric("A 학점", f"{sum(1 for r in scores if r['학점'] == 'A')}명")
 
-    st.subheader("학생별 성적표")
-    selected_name = st.selectbox("학생 선택", [row["이름"] for row in scores])
-    selected = next(row for row in scores if row["이름"] == selected_name)
-    render_report_card(selected)
-
     st.subheader("전체 성적 목록")
+    st.caption("총점 기준 석차순으로 정렬됩니다. 총점이 같으면 같은 석차로 표시합니다.")
     st.dataframe(scores, use_container_width=True, hide_index=True)
 
     c1, c2 = st.columns([1, 1])
