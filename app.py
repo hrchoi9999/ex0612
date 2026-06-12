@@ -1,1 +1,4 @@
-import main_0612
+from score_app import main
+
+
+main()
